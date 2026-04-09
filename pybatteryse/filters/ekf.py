@@ -240,7 +240,7 @@ class ExtendedKalmanFilter:
             update_model_parameters(self.statespace.coefficients, self.full_parameter_vector)
 
 
-    # pylint: disable=R0913, R0917
+    # pylint: disable=R0913, R0914, R0917
     def compute_state_jacobian(
         self,
         state,
@@ -415,7 +415,7 @@ class ExtendedKalmanFilter:
         return state_jacobian_base
 
 
-    # pylint: disable=R0915
+    # pylint: disable=R0914, R0915
     def compute_measurement_jacobian(
         self,
         state,
