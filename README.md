@@ -1,5 +1,13 @@
 # PyBatterySE
 
+<div>
+
+[![release](https://img.shields.io/github/v/release/muizabdul29/PyBatterySE)](https://github.com/muizabdul29/PyBatterySE/releases)
+[![Pylint](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml/badge.svg)](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml)
+
+</div>
+
+
 **PyBatterySE** — a shorthand for **Py**thon **Battery** **S**tate **E**stimation, is an open-source library for state estimation using Bayesian filters and linear parameter-varying (LPV) battery models.
 
 ## Installation
