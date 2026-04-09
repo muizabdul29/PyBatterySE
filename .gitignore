@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 
+*.egg-info
+build/
+dist/
+
+# Data & Results
+# data/
+# results/
+
+# vscode settings
+.vscode
+.pypirc
+.idea
+
+# Virtual environments
+.venv
+
+# 
+.pytest_cache
+
+# MAC garbage
+.DS_Store
