@@ -1,0 +1,3 @@
+pybatteryid>=3.0.1
+tqdm
+pytest
