@@ -76,7 +76,6 @@ class ExtendedKalmanFilter:
         self._build_theta_index_map()
 
 
-    # pylint: disable=R0914
     def _build_theta_index_map(self) -> None:
         """
         Build mapping from 'theta_i' string to index in full_parameter_vector.
@@ -192,16 +191,18 @@ class ExtendedKalmanFilter:
 
         # Validate each state name
         for name in state_names:
+            #
             if name == 'capacity':
                 continue  # capacity is valid
-            elif name in self.theta_index_map:
+            #
+            if name in self.theta_index_map:
                 continue  # valid theta index
-            else:
-                raise ValueError(
-                    f"Invalid state name: {name}. "
-                    f"Valid names are 'capacity' or 'theta_i' where i is in "
-                    f"range 1 to {len(self.full_parameter_vector)}"
-                )
+            #
+            raise ValueError(
+                f"Invalid state name: {name}. "
+                f"Valid names are 'capacity' or 'theta_i' where i is in "
+                f"range 1 to {len(self.full_parameter_vector)}"
+            )
 
         # Store configuration
         self.extended_state_names = list(state_names)
@@ -239,7 +240,7 @@ class ExtendedKalmanFilter:
             update_model_parameters(self.statespace.coefficients, self.full_parameter_vector)
 
 
-    # pylint: disable=R0914
+    # pylint: disable=R0913, R0917
     def compute_state_jacobian(
         self,
         state,
@@ -410,11 +411,11 @@ class ExtendedKalmanFilter:
             state_jacobian[base_dim:, base_dim:] = np.eye(num_extended)
 
             return state_jacobian
-        else:
-            return state_jacobian_base
+        #
+        return state_jacobian_base
 
 
-    # pylint: disable=R0914
+    # pylint: disable=R0915
     def compute_measurement_jacobian(
         self,
         state,
@@ -607,8 +608,9 @@ class ExtendedKalmanFilter:
                 measurement_jacobian[0, base_dim + i] = dh_dp
 
             return measurement_jacobian
-        else:
-            return measurement_jacobian_base
+        #
+        return measurement_jacobian_base
+
 
     # pylint: disable=R0914
     def predict(
