@@ -8,7 +8,7 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name='pybatteryse',
-    version='1.0.0',
+    version='1.0.1',
     author='Muiz Sheikh',
     description='Battery State Estimation in Python',
     long_description=readme,
