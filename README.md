@@ -10,6 +10,8 @@
 
 **PyBatterySE** — a shorthand for **Py**thon **Battery** **S**tate **E**stimation, is an open-source library for state estimation using Bayesian filters and linear parameter-varying (LPV) battery models.
 
+> ⚠️ **Beta:** This package is in beta. Core functionality works, but APIs may change before the stable release. Feedback and bug reports are welcome!
+
 ## Installation
 
 Use the package manager [pip](https://pip.pypa.io/en/stable/) to install PyBatterySE.
