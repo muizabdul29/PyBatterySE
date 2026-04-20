@@ -24,5 +24,6 @@ setup(
     classifiers = [
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
+        "Development Status :: 4 - Beta",
     ],
 )
