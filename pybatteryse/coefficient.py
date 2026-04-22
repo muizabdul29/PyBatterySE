@@ -1,23 +1,38 @@
 """Utilities concerning model state-space representation."""
 
 import re
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 
 import numpy as np
 
 
 @dataclass
 class CoefficientTerm:
+    """A single additive term in a model coefficient.
+
+    A model coefficient is expressed as a sum of terms, where each term
+    is the product of a scalar parameter and one or more basis functions.
+    For example:
+
+        b_0(k) = 2 * s(k) * log[s](k) + 4 * T(k) * 1/s(k)
+
+    is represented as two CoefficientTerm instances — one per summand.
+    The first would be
+    ``CoefficientTerm(parameter=2.0, basis_function_strings=["s(k)", "log[s](k)"])``.
+
+    Attributes:
+        parameter: Scalar multiplier for the term.
+        basis_function_strings: String identifiers of the basis functions
+            whose product forms the term. An empty list denotes a constant
+            term (i.e., just the parameter itself).
     """
-    Represents a term in the model coefficient. Note that the
-    coefficient is made up of several terms, e.g.,
-    b_0(k) = 2 * s(k) × log[s](k) + 4 * T(k) × 1/s(k) is made up
-    of two terms.
-    """
+
     parameter: float
-    basis_function_strings: list[str]
+    basis_function_strings: list[str] = field(default_factory=list)
 
 
+# Maps a coefficient name (e.g., "b_0") to its list of additive terms.
 Coefficients = dict[str, list[CoefficientTerm]]
 
 
@@ -67,31 +82,14 @@ def evaluate_coefficient(coefficient_terms: list[CoefficientTerm],
             if bf_string == '':
                 continue
             #
-            term_value *= signal_trajectories[f'{bf_string}(k)'][time_instant]
+            if time_instant == 0:
+                key = f'{bf_string}(k)'
+            elif time_instant > 0:
+                key = f'{bf_string}(k+{time_instant})'
+            else:
+                key = f'{bf_string}(k{time_instant})'  # negative sign is part of time_instant
+            #
+            term_value *= signal_trajectories[key][0]
         result.append(term_value)
 
     return np.sum(result)
-
-
-def update_model_parameters(coefficients: Coefficients, model_estimate: list[float]) -> None:
-    """Update coefficient parameters in-place from a flat model_estimate vector.
-
-    Iterates coefficients.items() in insertion order (a_1, a_2, ..., b_0, b_1, ...)
-    which matches the canonical parameter order guaranteed by extract_model_coefficients.
-    a-term parameters are stored with negated sign (convention from extract_model_coefficients).
-
-    Raises:
-        ValueError: If len(model_estimate) does not match the total subterm count.
-    """
-    all_keyed_subterms = [
-        (subterm, coefficient_key.startswith('a'))
-        for coefficient_key, subterms in coefficients.items()
-        for subterm in subterms
-    ]
-    if len(model_estimate) != len(all_keyed_subterms):
-        raise ValueError(
-            f"Parameter count mismatch: expected {len(all_keyed_subterms)} parameters "
-            f"but got {len(model_estimate)}."
-        )
-    for (subterm, is_a_coefficient), new_parameter in zip(all_keyed_subterms, model_estimate):
-        subterm.parameter = -new_parameter if is_a_coefficient else new_parameter
