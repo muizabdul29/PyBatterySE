@@ -388,6 +388,7 @@ class ParticleFilter:
 
         offset = 0
         for component in self.statespace.state_components:
+            # pylint: disable-next=protected-access
             size = self.statespace._block_sizes[component]
             if component == 's':
                 particles[:, offset] = np.random.uniform(0.0, 1.0,
@@ -413,6 +414,7 @@ class ParticleFilter:
         return particles
 
 
+    # pylint: disable-next=too-many-branches
     def run(self, dataset: dict, initial_particles: np.ndarray | str = 'auto'):
         """
         Run particle filter over the entire measurement sequence.

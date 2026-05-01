@@ -285,6 +285,7 @@ class StateSpace:
             offset += size
 
 
+    # pylint: disable-next=too-many-locals
     def linearize(self, state: np.ndarray,
                   current_value: float,
                   temperature_value: float | None = None,
@@ -422,6 +423,7 @@ class StateSpace:
     # ----- linearization helpers -----
 
 
+    # pylint: disable-next=too-many-locals
     def _soc_derivatives(self, soc_scalar: float,
                          current_value: float,
                          temperature_value: float | None,

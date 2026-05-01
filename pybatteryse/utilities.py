@@ -15,6 +15,7 @@ from .coefficient import extract_model_coefficients
 from .statespace import StateSpace, SocSource
 
 
+# pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
 def print_statespace_equations(statespace: StateSpace) -> None:
     """Print the expanded state-space equations for a StateSpace instance.
 
@@ -248,6 +249,7 @@ def print_statespace_equations(statespace: StateSpace) -> None:
     ))
 
 
+# pylint: disable-next=too-many-locals
 def print_input_output_coefficients(model: Model):
     """Print input-output (LPV) model coefficients as a rich table."""
     coefficients = extract_model_coefficients(
@@ -395,7 +397,7 @@ def compute_soc_observability_contributions(
         )
 
     # Normalize to the trajectory shape so the body has a single code path.
-    is_single_point = (state_values.ndim == 1)
+    is_single_point = state_values.ndim == 1
     if is_single_point:
         states = state_values.reshape(1, -1)
         currents = np.array([float(current_values)], dtype=float)

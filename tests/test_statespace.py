@@ -27,6 +27,7 @@ def test_state_transition_soc_w_overpotentials(model: Model):
     # Negative current = discharge, so with current_value=-1 SOC increases
     expected_soc = state[0] + (current_value * model.sampling_period) / model.battery_capacity
     #
+    # pylint: disable-next=protected-access
     trajectories = ss._build_signal_trajectories(
         soc_values=state[0],
         current_values=current_value,
@@ -65,6 +66,7 @@ def test_predicted_measurement_using_ss(model: Model):
                                                          current_value=current_value,
                                                          temperature_value=temperature_value)
 
+    # pylint: disable-next=protected-access
     trajectories = ss._build_signal_trajectories(
         soc_values=state[0],
         current_values=current_value,

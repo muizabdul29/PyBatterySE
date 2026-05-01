@@ -34,6 +34,7 @@ def plot_time_vs_parameter(time_soc_data_tuples: list[Tuple], figsize: Tuple[int
         linewidth=linewidth, xlims=xlims, ylims=ylims, colors=colors)
 
 
+# pylint: disable-next=too-many-locals
 def plot_soc_vs_gramian(soc_gramian_data_tuples: list[tuple], figsize: tuple[int, int] = (6, 2),
                         legends: list[str] | None = None, n_bins: int = 200,
                         units: Tuple[str, str] = ('-', '$V^2$'),
@@ -42,10 +43,11 @@ def plot_soc_vs_gramian(soc_gramian_data_tuples: list[tuple], figsize: tuple[int
                         colors: list[str] | None = None,
                         title: str | None = None,
                         xaxis_reverse: bool = False) -> None:
+    """A shortcut for soc vs. Gramian plots."""
     _, ax = plt.subplots(figsize=figsize)
 
     for idx, (soc, contributions) in enumerate(soc_gramian_data_tuples):
-        kwargs = dict(alpha=0.9, label=legends[idx] if legends is not None else None)
+        kwargs = {'alpha': 0.9, 'label': legends[idx] if legends is not None else None}
         if colors is not None:
             kwargs['color'] = colors[idx % len(colors)]
 
