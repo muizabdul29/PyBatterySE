@@ -122,7 +122,9 @@ ss = StateSpace(model, state_components=['s', 'overpotentials'])
 state_trajectory = simulate_state_trajectory(ss, dataset)
 gramian_contributions = compute_soc_observability_contributions(ss, state_trajectory, dataset)
 
-plot_soc_vs_gramian(gramian_contributions, state_trajectory)
+plot_soc_vs_gramian(
+    [(state_trajectory[:, 0], gramian_contributions['total'])],
+)
 ```
 
 #### 3. Ageing-aware model estimation
