@@ -19,6 +19,7 @@ setup(
         'pybatteryid>=3.0.2',
         'numpy>=2.1.0',
         'tqdm>=4.67.3',
+        'scipy<1.17'
     ],
     tests_require=[],
     classifiers = [
