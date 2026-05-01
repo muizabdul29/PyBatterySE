@@ -3,6 +3,7 @@
 <div>
 
 [![release](https://img.shields.io/github/v/release/muizabdul29/PyBatterySE)](https://github.com/muizabdul29/PyBatterySE/releases)
+[![Tests](https://github.com/muizabdul29/PyBatterySE/actions/workflows/tests.yml/badge.svg)](https://github.com/muizabdul29/PyBatterySE/actions/workflows/tests.yml)
 [![Pylint](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml/badge.svg)](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml)
 
 </div>
