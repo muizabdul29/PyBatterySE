@@ -36,6 +36,20 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install --no-cache-dir --upgrade -r requirements.txt; fi
 
+      - name: Debug installed versions
+        run: |
+          echo "=== pybatteryid ==="
+          pip show pybatteryid
+          echo ""
+          echo "=== Available versions on PyPI ==="
+          pip index versions pybatteryid || true
+          echo ""
+          echo "=== Full pip freeze ==="
+          pip freeze
+          echo ""
+          echo "=== Import check ==="
+          python -c "import pybatteryid; print('Module path:', pybatteryid.__file__); print('Version:', getattr(pybatteryid, '__version__', 'no __version__ attribute'))"
+
       - name: Install package
         run: |
           pip install -e .
