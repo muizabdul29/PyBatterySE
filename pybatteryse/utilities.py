@@ -1,10 +1,18 @@
 """Utility functions for working with state-space representations."""
 
+import copy
+
+import numpy as np
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from rich.table import Table
+from rich.markup import escape
 
-from .statespace import StateSpace
+from pybatteryid.dataclasses import Model
+
+from .coefficient import extract_model_coefficients
+from .statespace import StateSpace, SocSource
 
 
 def print_statespace_equations(statespace: StateSpace) -> None:
@@ -238,3 +246,410 @@ def print_statespace_equations(statespace: StateSpace) -> None:
         title="[bold]State-space equations[/bold]",
         expand=False,
     ))
+
+
+def print_input_output_coefficients(model: Model):
+    """Print input-output (LPV) model coefficients as a rich table."""
+    coefficients = extract_model_coefficients(
+        model.model_terms, model.model_estimate
+    )
+
+    console = Console()
+    table = Table(title="Model Coefficients")
+    table.add_column("Coefficient equations")
+    table.add_column("Parameter values")
+
+    subs = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+
+    theta_idx = 1
+    for coeff_name, terms in coefficients.items():
+        if "_" in coeff_name:
+            base, idx = coeff_name.split("_", 1)
+            display_name = f"{base}{idx.translate(subs)}(p)"
+        else:
+            base = coeff_name
+            display_name = f"{coeff_name}(p)"
+
+        negate = base == "a"
+
+        summands = []
+        values = []
+        for term in terms:
+            theta = f"θ{str(theta_idx).translate(subs)}"
+            basis_strs = [s for s in term.basis_function_strings if s]
+            if basis_strs:
+                summand = f"{theta}·{'·'.join(basis_strs)}"
+            else:
+                summand = theta
+            summands.append(summand)
+            value = -term.parameter if negate else term.parameter
+            values.append(f"{theta} = {value:.4g}")
+            theta_idx += 1
+
+        if not summands:
+            expression = "0"
+        elif negate:
+            expression = f"-{summands[0]}"
+            for s in summands[1:]:
+                expression += f"\n  - {s}"
+        else:
+            expression = summands[0]
+            for s in summands[1:]:
+                expression += f"\n  + {s}"
+
+        equation = f"{display_name} = {expression}"
+        values_str = "\n".join(values) if values else "—"
+        table.add_row(escape(equation), escape(values_str))
+
+    console.print(table)
+
+
+# pylint: disable=R0913, R0914, R0917
+def compute_soc_observability_contributions(
+    statespace: StateSpace,
+    state_values: np.ndarray,
+    current_values: float | np.ndarray,
+    horizon: int = 100,
+    temperature_values: float | np.ndarray | None = None,
+) -> dict:
+    """Decompose the SOC-diagonal of a finite-horizon observability
+    Gramian into contributions from three measurement-equation sources.
+
+    Single-point or trajectory analysis based on the shape of
+    ``state_values``:
+        - 1-D (shape ``(state_dimension,)``): single linearization point;
+          ``current_values`` and ``temperature_values`` must be scalars (or
+          ``None`` for ``temperature_values``). Returns a dict of scalars.
+        - 2-D (shape ``(T, state_dimension)``): trajectory;
+          ``current_values`` is a length-T array, ``temperature_values`` is
+          a length-T array or ``None``. Returns a dict of length-T arrays.
+
+    For each linearization point, computes
+    ``W_i = sum_{k=0}^{horizon} ((C_i @ A^k)[soc_offset])^2`` for three
+    partial measurement Jacobians ``C_i``, with ``A`` (= ``df_dx``) held
+    constant at the lin point. This is the standard local observability
+    formulation; an LPV-time-varying analogue would require a known future
+    input trajectory.
+
+    Sources:
+        emf:         only ``dV_OCV/ds`` at ``soc_offset``.
+        b0_direct:   only ``(db_0/ds) * u`` at ``soc_offset``.
+        op_dynamics: only ``e_1^T`` on the overpotentials block. SOC enters
+                     future measurements via the SOC column of ``A``
+                     propagating perturbations into overpotentials.
+
+    Cross terms between the three sources mean their percentages don't sum
+    to 100; the gap reflects cross-term contributions and can be negative
+    when sources partially cancel.
+
+    Calls ``statespace.update_model_from_state(...)`` at every linearization
+    point so the coefficients reflect any theta / capacity entries in the
+    state vector.
+
+    Parameters
+    ----------
+    statespace : StateSpace
+        State-space model. Must have ``'s'`` in ``state_components``.
+    state_values : np.ndarray
+        State vector or trajectory; see shape rules above.
+    current_values : float or np.ndarray
+        Input current at the lin point (scalar) or trajectory (1-D array).
+    horizon : int, default 100
+        Number of forward steps included in the Gramian sum (k = 0..horizon).
+    temperature_values : float, np.ndarray, or None
+        Same conventions as ``StateSpace.linearize``, broadcast along the
+        trajectory in the 2-D case.
+
+    Returns
+    -------
+    dict with keys 'total', 'emf', 'b0_direct', 'op_dynamics', 'cross_term'.
+    Values are scalars (single-point case) or length-T arrays (trajectory
+    case). ``cross_term`` is ``total - (emf + b0_direct + op_dynamics)`` --
+    the gap captures pairwise cross terms between the three sources and
+    can be negative when contributions partially cancel. Percentages are
+    not provided -- compute them from these values (e.g.
+    ``100 * out['emf'] / out['total']``).
+
+    Raises
+    ------
+    ValueError
+        If SOC is not in ``state_components``, ``horizon < 1``,
+        ``state_values`` is not 1-D or 2-D, or input arrays are shorter
+        than the state trajectory.
+    """
+    # pylint: disable=protected-access
+    if statespace._soc_source is not SocSource.STATE:
+        raise ValueError(
+            "compute_soc_observability_contributions requires 's' in "
+            "state_components; SOC observability is undefined when SOC "
+            "is supplied exogenously."
+        )
+    if horizon < 1:
+        raise ValueError(f"horizon must be >= 1, got {horizon}.")
+
+    state_values = np.asarray(state_values, dtype=float)
+    if state_values.ndim not in (1, 2):
+        raise ValueError(
+            f"state_values must be 1-D (single point) or 2-D (trajectory), "
+            f"got shape {state_values.shape}."
+        )
+
+    # Normalize to the trajectory shape so the body has a single code path.
+    is_single_point = (state_values.ndim == 1)
+    if is_single_point:
+        states = state_values.reshape(1, -1)
+        currents = np.array([float(current_values)], dtype=float)
+        temperatures = (
+            None if temperature_values is None
+            else np.array([float(temperature_values)], dtype=float)
+        )
+    else:
+        states = state_values
+        currents = np.asarray(current_values, dtype=float)
+        temperatures = (
+            None if temperature_values is None
+            else np.asarray(temperature_values, dtype=float)
+        )
+
+    num_timesteps = states.shape[0]
+    if currents.shape[0] < num_timesteps:
+        raise ValueError(
+            f"current_values has length {currents.shape[0]} but "
+            f"state_values has {num_timesteps} entries; need at least "
+            f"as many."
+        )
+    if temperatures is not None and temperatures.shape[0] < num_timesteps:
+        raise ValueError(
+            f"temperature_values has length {temperatures.shape[0]} but "
+            f"state_values has {num_timesteps} entries."
+        )
+
+    # Work on a copy of the statespace to avoid side effects on the caller's
+    # instance: each iteration calls update_model_from_state(state_k), which
+    # mutates model_estimate, battery_capacity, and subterm.parameter fields.
+    statespace = _copy_statespace(statespace)
+
+    soc_offset = statespace._soc_offset
+    op_offset = statespace._overpotentials_offset
+    state_dim = statespace.state_dimension
+
+    keys = ('total', 'emf', 'b0_direct', 'op_dynamics', 'cross_term')
+    out = {key: np.full(num_timesteps, np.nan) for key in keys}
+
+    iterator = range(num_timesteps)
+
+    for k in iterator:
+        state_k = states[k]
+        current_k = float(currents[k])
+        temperature_k = (
+            None if temperatures is None else float(temperatures[k])
+        )
+
+        statespace.update_model_from_state(state_k)
+        soc_scalar = float(state_k[soc_offset])
+
+        lin = statespace.linearize(
+            state_k, current_k,
+            temperature_value=temperature_k,
+        )
+        matrix_a = lin.df_dx
+
+        # Split the SOC entry of dh_dx into its EMF and b_0-direct parts.
+        # linearize stores their sum (demf_ds + db0_ds * u) in dh_dx[soc_offset];
+        # we re-derive the split via _soc_derivatives.
+        _, _, db0_ds, demf_ds = statespace._soc_derivatives(
+            soc_scalar=soc_scalar,
+            current_value=current_k,
+            temperature_value=temperature_k,
+        )
+
+        # Three partial C row-vectors with the same shape as dh_dx.
+        c_emf = np.zeros(state_dim, dtype=float)
+        c_emf[soc_offset] = demf_ds
+
+        c_b0_direct = np.zeros(state_dim, dtype=float)
+        c_b0_direct[soc_offset] = db0_ds * current_k
+
+        c_op_dynamics = np.zeros(state_dim, dtype=float)
+        c_op_dynamics[op_offset] = 1.0
+
+        # lin.dh_dx equals c_emf + c_b0_direct + c_op_dynamics PLUS any
+        # theta-in-b_0 entries (cross-cutting thetas). Using lin.dh_dx for
+        # the total includes those theta contributions.
+
+        # Inline Gramian-diagonal computation: for each partial C row,
+        # propagate v_k = v_{k-1} @ A and accumulate (v_k[soc_offset])^2.
+        for label, c_row in (
+            ('emf', c_emf),
+            ('b0_direct', c_b0_direct),
+            ('op_dynamics', c_op_dynamics),
+            ('total', lin.dh_dx),
+        ):
+            v = c_row.copy()
+            w = float(v[soc_offset]) ** 2
+            for _ in range(1, horizon + 1):
+                v = v @ matrix_a
+                w += float(v[soc_offset]) ** 2
+            out[label][k] = w
+
+        # Cross-term contribution: gap between the full-C Gramian and the
+        # sum of self-contributions. Captures pairwise cross terms between
+        # the three sources plus any contribution from theta-in-b_0 entries
+        # of dh_dx (which are present in the total but not in the three
+        # partial C's). Can be negative when sources partially cancel.
+        out['cross_term'][k] = (
+            out['total'][k]
+            - out['emf'][k] - out['b0_direct'][k] - out['op_dynamics'][k]
+        )
+
+    if is_single_point:
+        return {key: float(out[key][0]) for key in keys}
+    return out
+
+
+def simulate_state_trajectory(
+    statespace: StateSpace,
+    initial_state: np.ndarray,
+    current_values: np.ndarray,
+    temperature_values: np.ndarray | None = None,
+    soc_values: np.ndarray | None = None,
+) -> np.ndarray:
+    """Forward-simulate the deterministic state trajectory under the model.
+
+    Iterates ``statespace.evaluate_next_state`` over the provided input
+    series, producing the model's noise-free state evolution. Useful for
+    generating reference / 'true' state trajectories given an input
+    current sequence -- e.g. to compare against an EKF estimate.
+
+    Conventions match ``ExtendedKalmanFilter.run``: the returned array
+    has shape ``(T, state_dimension)`` where ``T = len(current_values)``,
+    ``state_values[0] = initial_state``, and ``state_values[k]`` is
+    obtained by applying ``evaluate_next_state`` to ``state_values[k-1]``
+    with input ``current_values[k-1]`` (so ``current_values[-1]`` is
+    unused, matching the EKF convention).
+
+    Operates on a local copy of ``statespace`` so the caller's instance
+    is not mutated. ``update_model_from_state(initial_state)`` is called
+    on the copy at the start so that any ``theta_*`` / ``capacity``
+    entries in ``initial_state`` are reflected in the coefficients used
+    throughout the simulation. Random-walk states (theta, capacity) keep
+    their initial values for the whole trajectory; their effect on
+    coefficients is therefore fixed at the initial-state values.
+
+    Parameters
+    ----------
+    statespace : StateSpace
+        State-space model (not mutated).
+    initial_state : np.ndarray
+        Shape ``(state_dimension,)``. Block layout matches
+        ``state_components``.
+    current_values : np.ndarray
+        Length-T input current series.
+    temperature_values : np.ndarray or None, default None
+        Length-T temperature series for temperature-dependent models.
+        Pass ``None`` for temperature-independent models.
+    soc_values : np.ndarray or None, default None
+        Length-T exogenous SOC series. Required when SOC source is
+        ``SocSource.EXOGENOUS``; ignored when SOC is in state.
+
+    Returns
+    -------
+    np.ndarray of shape ``(T, state_dimension)``.
+
+    Raises
+    ------
+    ValueError
+        If ``current_values`` is empty, the optional input arrays are
+        shorter than ``current_values``, or the SOC source is
+        ``EXOGENOUS`` but ``soc_values`` is None.
+    """
+    initial_state = np.asarray(initial_state, dtype=float)
+    current_values = np.asarray(current_values, dtype=float)
+    num_timesteps = current_values.shape[0]
+    if num_timesteps < 1:
+        raise ValueError(
+            f"current_values must have at least 1 entry, got {num_timesteps}."
+        )
+
+    if temperature_values is not None:
+        temperature_values = np.asarray(temperature_values, dtype=float)
+        if temperature_values.shape[0] < num_timesteps:
+            raise ValueError(
+                f"temperature_values has length {temperature_values.shape[0]} "
+                f"but current_values has {num_timesteps} entries."
+            )
+
+    # pylint: disable=protected-access
+    if statespace._soc_source is SocSource.EXOGENOUS and soc_values is None:
+        raise ValueError(
+            "soc_values is required when the statespace uses "
+            "SocSource.EXOGENOUS (i.e. 's' is not in state_components)."
+        )
+    if soc_values is not None:
+        soc_values = np.asarray(soc_values, dtype=float)
+        if soc_values.shape[0] < num_timesteps:
+            raise ValueError(
+                f"soc_values has length {soc_values.shape[0]} "
+                f"but current_values has {num_timesteps} entries."
+            )
+
+    statespace = _copy_statespace(statespace)
+    statespace.update_model_from_state(initial_state)
+
+    state_values = np.empty((num_timesteps, statespace.state_dimension), dtype=float)
+    state_values[0] = initial_state
+
+    for k in range(1, num_timesteps):
+        state_values[k] = statespace.evaluate_next_state(
+            state_values[k - 1],
+            float(current_values[k - 1]),
+            temperature_value=(
+                None if temperature_values is None
+                else float(temperature_values[k - 1])
+            ),
+            soc_value=(
+                None if soc_values is None
+                else float(soc_values[k - 1])
+            ),
+        )
+
+    return state_values
+
+
+def _copy_statespace(statespace: StateSpace) -> StateSpace:
+    """Return a copy of ``statespace`` whose mutation surface is independent
+    of the original.
+
+    Shallow-copies the ``StateSpace`` shell, then deep-copies the mutable
+    parts that ``update_model_from_state`` writes to:
+        - ``model_estimate`` (numpy array): independent copy.
+        - subterm objects in ``coefficients``: shallow-copied so their
+          ``.parameter`` fields are independent. ``coefficients`` dict is
+          rebuilt to point at the new subterms.
+        - ``_theta_info``: rebuilt so the (subterm, key) tuples reference
+          the new subterms.
+
+    The rest (``emf_function``, ``basis_functions``, layout caches,
+    ``_soc_domain_min/max``) is shared with the original, since these are
+    immutable from the perspective of mutation paths in
+    ``update_model_from_state``. Subterm basis-function attributes are
+    stateless and remain shared.
+    """
+    # pylint: disable=protected-access
+    new = copy.copy(statespace)
+    new.model_estimate = statespace.model_estimate.copy()
+    old_to_new_subterm = {}
+    new_coefficients = {}
+    for key, subterms in statespace.coefficients.items():
+        new_subterms = []
+        for subterm in subterms:
+            new_subterm = copy.copy(subterm)
+            old_to_new_subterm[id(subterm)] = new_subterm
+            new_subterms.append(new_subterm)
+        new_coefficients[key] = new_subterms
+    new.coefficients = new_coefficients
+    new._theta_info = [
+        (old_to_new_subterm[id(subterm)], key)
+        for subterm, key in statespace._theta_info
+    ]
+    return new

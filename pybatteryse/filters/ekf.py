@@ -1,7 +1,6 @@
 """Implementation of Extended Kalman Filter."""
 
 import warnings
-from contextlib import contextmanager
 
 import numpy as np
 from tqdm import tqdm
@@ -32,10 +31,18 @@ class ExtendedKalmanFilter:
     to the process-noise covariance parameterized by ``variance_eta_theta``
     and ``variance_eta_capacity``; the ``s`` and ``overpotentials`` blocks
     inherit their process noise from the input-current noise via
-    ``B B^T * var_eta_u``. Before each predict and update the filter syncs
-    the statespace's model parameters and capacity from the current state
-    via ``StateSpace.update_model_from_state``, so the linearizations reflect
-    the filter's current belief about those quantities.
+    ``B B^T * var_eta_u``.
+
+    Jacobians of f and h are obtained analytically from
+    ``StateSpace.linearize``, which exploits the LPV structure of the model
+    (companion-form overpotentials, linear SOC integrator, random-walk
+    extended states). The only finite difference left is a 1-D central
+    difference on the SOC scalar to capture the basis-function dependence
+    on SOC; everything else is closed form. Before each predict and update
+    the filter syncs the statespace's model parameters and capacity from
+    the current state via ``StateSpace.update_model_from_state``, so the
+    linearizations and nonlinear evaluations both reflect the filter's
+    current belief about those quantities.
     """
 
     statespace: StateSpace
@@ -68,8 +75,12 @@ class ExtendedKalmanFilter:
 
         self._validate_variances()
 
-        self._soc_min = float(np.min(self.statespace.emf_function.voltage_func.x)) + 1e-3
-        self._soc_max = float(np.max(self.statespace.emf_function.voltage_func.x)) - 1e-3
+        # Buffer the SOC clip range slightly inside the EMF domain to keep
+        # state evaluations away from the knot endpoints. The raw domain
+        # bounds come from the statespace; we just add the buffer here.
+        # pylint: disable=protected-access
+        self._soc_min = self.statespace._soc_domain_min + 1e-3
+        self._soc_max = self.statespace._soc_domain_max - 1e-3
 
         self.state_estimate = None
         self.error_covariance = None
@@ -98,40 +109,27 @@ class ExtendedKalmanFilter:
 
         self.statespace.update_model_from_state(state)
 
-        # Linearizations via central finite differences.
-        matrix_a = self._jacobian_wrt_state(
-            self.statespace.evaluate_next_state,
-            state, previous_current, previous_temperature, previous_soc,
-        )
-        matrix_b = self._jacobian_wrt_input(
-            self.statespace.evaluate_next_state,
-            state, previous_current, previous_temperature, previous_soc,
-        )
-        matrix_c = self._jacobian_wrt_state(
-            self.statespace.evaluate_predicted_measurement,
-            state, previous_current, previous_temperature, previous_soc,
-        )
-        matrix_d = self._jacobian_wrt_input(
-            self.statespace.evaluate_predicted_measurement,
-            state, previous_current, previous_temperature, previous_soc,
+        lin = self.statespace.linearize(
+            state, previous_current,
+            temperature_value=previous_temperature, soc_value=previous_soc,
         )
 
         # Noise covariances.
-        #   Q = B B^T * var_eta_u  (+ random-walk diag for extended states)
-        #   R = D^2 * var_eta_u + var_eta_y_e      (scalar)
-        #   S = B D * var_eta_u                    (shape (n,))
-        matrix_q = np.outer(matrix_b, matrix_b) * self.variance_eta_u
+        #   Q = (df/du)(df/du)^T * var_eta_u  (+ random-walk diag for extended states)
+        #   R = (dh/du)^2 * var_eta_u + var_eta_y_e        (scalar)
+        #   S = (df/du)(dh/du) * var_eta_u                 (shape (n,))
+        matrix_q = np.outer(lin.df_du, lin.df_du) * self.variance_eta_u
         matrix_q[np.diag_indices_from(matrix_q)] += self._extended_state_noise_diag
 
-        scalar_r = (matrix_d * matrix_d) * self.variance_eta_u + self.variance_eta_y_e
-        vector_s = matrix_b * matrix_d * self.variance_eta_u
+        scalar_r = (lin.dh_du ** 2) * self.variance_eta_u + self.variance_eta_y_e
+        vector_s = lin.df_du * lin.dh_du * self.variance_eta_u
 
         # Covariance with correlated-noise correction:
-        #   P+ = (A - S R^-1 C) P (A - S R^-1 C)^T + Q - S R^-1 S^T
-        feedback_gain = np.outer(vector_s, matrix_c) / scalar_r
-        a_eff = matrix_a - feedback_gain
+        #   P+ = (df/dx - S R^-1 dh/dx) P (...)^T + Q - S R^-1 S^T
+        feedback_gain = np.outer(vector_s, lin.dh_dx) / scalar_r
+        df_dx_eff = lin.df_dx - feedback_gain
         predicted_covariance = (
-            a_eff @ cov @ a_eff.T
+            df_dx_eff @ cov @ df_dx_eff.T
             + matrix_q
             - np.outer(vector_s, vector_s) / scalar_r
         )
@@ -169,18 +167,15 @@ class ExtendedKalmanFilter:
         """
         self.statespace.update_model_from_state(predicted_state)
 
-        matrix_c = self._jacobian_wrt_state(
-            self.statespace.evaluate_predicted_measurement,
-            predicted_state, present_current, present_temperature, present_soc,
-        )
-        matrix_d = self._jacobian_wrt_input(
-            self.statespace.evaluate_predicted_measurement,
-            predicted_state, present_current, present_temperature, present_soc,
+        lin = self.statespace.linearize(
+            predicted_state, present_current,
+            temperature_value=present_temperature, soc_value=present_soc,
         )
 
-        scalar_r = (matrix_d * matrix_d) * self.variance_eta_u + self.variance_eta_y_e
-        innovation_variance = float(matrix_c @ predicted_covariance @ matrix_c) + scalar_r
-        kalman_gain = (predicted_covariance @ matrix_c) / innovation_variance
+
+        scalar_r = (lin.dh_du ** 2) * self.variance_eta_u + self.variance_eta_y_e
+        innovation_variance = float(lin.dh_dx @ predicted_covariance @ lin.dh_dx) + scalar_r
+        kalman_gain = (predicted_covariance @ lin.dh_dx) / innovation_variance
 
         predicted_measurement = self.statespace.evaluate_predicted_measurement(
             predicted_state, present_current,
@@ -191,11 +186,11 @@ class ExtendedKalmanFilter:
 
         updated_state = predicted_state + kalman_gain * innovation
 
-        # Joseph-form covariance update: P+ = (I - K C) P (I - K C)^T + K R K^T
+        # Joseph-form covariance update: P+ = (I - K dh/dx) P (...)^T + K R K^T
         identity = np.eye(updated_state.shape[0])
-        i_minus_kc = identity - np.outer(kalman_gain, matrix_c)
+        i_minus_k_dhdx = identity - np.outer(kalman_gain, lin.dh_dx)
         updated_covariance = (
-            i_minus_kc @ predicted_covariance @ i_minus_kc.T
+            i_minus_k_dhdx @ predicted_covariance @ i_minus_k_dhdx.T
             + np.outer(kalman_gain, kalman_gain) * scalar_r
         )
 
@@ -209,24 +204,9 @@ class ExtendedKalmanFilter:
         dataset: dict,
         initial_state: np.ndarray,
         initial_covariance: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Run the EKF on a full dataset.
-
-        Parameters
-        ----------
-        dataset : dict
-            Measurement arrays keyed by name. Recognized keys:
-                - 'current_values'     (required, length T)
-                - 'voltage_values'     (required, length T)
-                - 'temperature_values' (optional; required only when the
-                  model is temperature-dependent)
-                - 'soc_values'         (required iff the statespace uses
-                  SocSource.EXOGENOUS)
-        initial_state : np.ndarray
-            Initial state estimate, shape (state_dimension,).
-        initial_covariance : np.ndarray
-            Initial error covariance, shape (state_dimension, state_dimension).
 
         Returns
         -------
@@ -234,6 +214,10 @@ class ExtendedKalmanFilter:
             Estimated state trajectory, shape (T, state_dimension). On
             divergence, returns the partial trajectory up to (but not
             including) the diverged step.
+        error_covariances : np.ndarray
+            Error covariance trajectory, shape (T, state_dimension,
+            state_dimension). Truncated consistently with state_estimates
+            on divergence.
         """
         try:
             current_values = np.asarray(dataset["current_values"], dtype=float)
@@ -274,14 +258,17 @@ class ExtendedKalmanFilter:
         self.error_covariance = np.asarray(initial_covariance, dtype=float).copy()
         self.statespace.update_model_from_state(self.state_estimate)
 
-        state_estimates = np.zeros((num_timesteps, self.statespace.state_dimension))
+        n = self.statespace.state_dimension
+        state_estimates = np.zeros((num_timesteps, n))
+        error_covariances = np.zeros((num_timesteps, n, n))
         state_estimates[0, :] = self.state_estimate
+        error_covariances[0, :, :] = self.error_covariance
 
         def scalar(arr, k):
             return None if arr is None else float(arr[k])
 
         for k in tqdm(range(1, num_timesteps),
-                      desc="EKF Progress", unit="step", ncols=100):
+                    desc="EKF Progress", unit="step", ncols=100):
             predicted_state, predicted_covariance = self.predict(
                 previous_current=float(current_values[k - 1]),
                 previous_voltage=float(voltage_values[k - 1]),
@@ -305,13 +292,14 @@ class ExtendedKalmanFilter:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                return state_estimates[:k, :]
+                return state_estimates[:k, :], error_covariances[:k, :, :]
 
             self.state_estimate = updated_state
             self.error_covariance = updated_covariance
             state_estimates[k, :] = updated_state
+            error_covariances[k, :, :] = updated_covariance
 
-        return state_estimates
+        return state_estimates, error_covariances
 
 
     # ------------------------------------------------------------------
@@ -370,102 +358,3 @@ class ExtendedKalmanFilter:
             state[soc_offset] = np.clip(
                 state[soc_offset], self._soc_min, self._soc_max
             )
-
-    # --- Finite-difference Jacobians -----------------------------------
-
-    _SQRT_EPS = float(np.sqrt(np.finfo(np.float64).eps))
-
-    @classmethod
-    def _fd_step(cls, value: float) -> float:
-        return cls._SQRT_EPS * max(abs(float(value)), 1.0)
-
-
-    def _with_model_synced_to(self, state: np.ndarray):
-        """Context manager: sync statespace model to `state`, restore on exit.
-
-        Needed inside finite-difference Jacobians so that perturbing theta_i
-        or capacity entries of the state actually flows through into func's
-        output. Snapshots model_estimate, battery_capacity, and the
-        subterm.parameter values that update_model_from_state mutates, and
-        restores them when the block exits.
-        """
-
-        @contextmanager
-        def _cm():
-            ss = self.statespace
-            # pylint: disable=protected-access
-            saved_model_estimate = ss.model_estimate.copy()
-            saved_capacity = ss.battery_capacity
-            saved_subterm_params = [
-                (subterm, subterm.parameter)
-                for subterm, _ in ss._theta_subterm_map
-            ]
-            try:
-                ss.update_model_from_state(state)
-                yield
-            finally:
-                ss.model_estimate[:] = saved_model_estimate
-                ss.battery_capacity = saved_capacity
-                for subterm, original in saved_subterm_params:
-                    subterm.parameter = original
-
-        return _cm()
-
-
-    def _jacobian_wrt_state(
-        self,
-        func,
-        state: np.ndarray,
-        current_value: float,
-        temperature_value: float | None,
-        soc_value: float | None,
-    ) -> np.ndarray:
-        """Central-difference Jacobian of ``func`` with respect to ``state``."""
-        n = state.shape[0]
-        jacobian: np.ndarray | None = None
-
-        for i in range(n):
-            step = self._fd_step(state[i])
-            state_plus = state.copy()
-            state_minus = state.copy()
-            state_plus[i] += step
-            state_minus[i] -= step
-
-            with self._with_model_synced_to(state_plus):
-                f_plus = np.atleast_1d(func(
-                    state_plus, current_value,
-                    temperature_value=temperature_value, soc_value=soc_value,
-                ))
-            with self._with_model_synced_to(state_minus):
-                f_minus = np.atleast_1d(func(
-                    state_minus, current_value,
-                    temperature_value=temperature_value, soc_value=soc_value,
-                ))
-
-            if jacobian is None:
-                jacobian = np.empty((f_plus.size, n), dtype=np.float64)
-            jacobian[:, i] = (f_plus - f_minus) / (2.0 * step)
-
-        return jacobian[0] if jacobian.shape[0] == 1 else jacobian
-
-
-    def _jacobian_wrt_input(
-        self,
-        func,
-        state: np.ndarray,
-        current_value: float,
-        temperature_value: float | None,
-        soc_value: float | None,
-    ) -> np.ndarray | float:
-        """Central-difference derivative of ``func`` w.r.t. scalar ``current_value``."""
-        step = self._fd_step(current_value)
-        f_plus = np.atleast_1d(func(
-            state, current_value + step,
-            temperature_value=temperature_value, soc_value=soc_value,
-        ))
-        f_minus = np.atleast_1d(func(
-            state, current_value - step,
-            temperature_value=temperature_value, soc_value=soc_value,
-        ))
-        derivative = (f_plus - f_minus) / (2.0 * step)
-        return float(derivative[0]) if derivative.size == 1 else derivative

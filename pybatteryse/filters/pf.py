@@ -54,9 +54,13 @@ class ParticleFilter:
             state_components, ``None`` otherwise.
         particles: Current particle states, shape
             ``(num_particles, state_dimension)``. ``None`` until
-            ``run`` is called.
-        weights: Normalised particle weights, shape ``(num_particles,)``.
-            Reset to uniform after each resampling step.
+            ``run`` is called. Holds the post-resample cloud after each
+            ``step``.
+        weights: Normalised particle weights from the most recent
+            measurement update (pre-resample), shape
+            ``(num_particles,)``. Initialised uniform; refreshed by
+            ``step``. These index the propagated particle cloud at the
+            update, not the post-resample ``particles`` field.
         eta_particles: Current-sensor-bias estimates per particle, shape
             ``(num_particles,)``, carried through resampling.
     """
@@ -187,6 +191,12 @@ class ParticleFilter:
         """
         Execute one prediction-update cycle.
 
+        After this call, ``self.weights`` holds the normalised
+        per-particle weights from the measurement update (pre-resample),
+        which index the propagated particle cloud at this step rather
+        than the resampled ``self.particles``. Useful for diagnostics
+        like effective sample size or weight degeneracy.
+
         Args:
             previous_temperature: Temperature at time k-1 (may be None for
                 temperature-independent models).
@@ -249,9 +259,11 @@ class ParticleFilter:
             p=weights_normalised, replace=True
         )
 
-        # Update particle set
+        # Update particle set. self.weights holds the pre-resample
+        # normalised weights for diagnostics; self.particles is the
+        # post-resample cloud.
         self.particles = particles_next[resampled_indices]
-        self.weights[:] = 1.0 / self.num_particles
+        self.weights = weights_normalised
         self.eta_particles = eta_k[resampled_indices]
 
 
@@ -352,8 +364,15 @@ class ParticleFilter:
 
 
     def estimate(self) -> np.ndarray:
-        """Return the weighted mean state estimate."""
-        return np.average(self.particles, axis=0, weights=self.weights)
+        """Return the mean state estimate over the post-resample cloud.
+
+        Importance weighting is already baked into ``self.particles`` by
+        the resampling step, so a plain mean is the correct estimator
+        here. ``self.weights`` carries the pre-resample weights for
+        diagnostics and indexes a different cloud, so it is intentionally
+        not used.
+        """
+        return self.particles.mean(axis=0)
 
 
     def _generate_initial_particles(self) -> np.ndarray:
@@ -412,8 +431,16 @@ class ParticleFilter:
                 _generate_initial_particles for bounds.
 
         Returns:
-            estimates: State estimates at each time step
-                (num_timesteps, state_dim).
+            Tuple ``(estimates, weight_trajectories)``:
+                - estimates: State estimates at each time step,
+                  shape ``(num_timesteps, state_dim)``.
+                - weight_trajectories: Normalised particle weights from
+                  each measurement update *before* resampling, shape
+                  ``(num_timesteps, num_particles)``. Row 0 is uniform
+                  (1/num_particles) since no update has occurred yet;
+                  rows 1..num_timesteps-1 contain the post-likelihood,
+                  pre-resample weights and pair with the propagated
+                  particle cloud at that step.
         """
         try:
             current_values = np.asarray(dataset["current_values"], dtype=float)
@@ -478,11 +505,16 @@ class ParticleFilter:
         self.particles = np.array(initial_particles, dtype=float, copy=True)
 
         # Reset per-run particle auxiliaries
-        self.weights[:] = 1.0 / self.num_particles
+        self.weights = np.ones(self.num_particles) / self.num_particles
         self.eta_particles[:] = 0.0
 
         state_estimates = np.zeros((num_timesteps, self.statespace.state_dimension))
+        weight_trajectories = np.zeros((num_timesteps, self.num_particles))
+
         state_estimates[0] = self.estimate()
+        # No measurement update has occurred at k=0 — record the uniform
+        # prior weights to keep the array shape-aligned with state_estimates.
+        weight_trajectories[0] = self.weights
 
         def scalar(arr, k):
             return None if arr is None else float(arr[k])
@@ -503,5 +535,6 @@ class ParticleFilter:
                     f"Particle filter failed at time step {k}: {exc}"
                 ) from exc
             state_estimates[k] = self.estimate()
+            weight_trajectories[k] = self.weights
 
-        return state_estimates
+        return state_estimates, weight_trajectories
