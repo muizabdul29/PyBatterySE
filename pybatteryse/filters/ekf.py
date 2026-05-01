@@ -5,7 +5,8 @@ import warnings
 import numpy as np
 from tqdm import tqdm
 
-from ..statespace import StateSpace, SocSource
+from ..statespace import StateSpace
+from ._common import check_nonnegative, validate_optional_variances, parse_dataset
 
 
 # pylint: disable=R0902,R0913
@@ -219,40 +220,10 @@ class ExtendedKalmanFilter:
             state_dimension). Truncated consistently with state_estimates
             on divergence.
         """
-        try:
-            current_values = np.asarray(dataset["current_values"], dtype=float)
-            voltage_values = np.asarray(dataset["voltage_values"], dtype=float)
-        except KeyError as exc:
-            raise KeyError(
-                f"dataset is missing required key {exc.args[0]!r}; "
-                f"'current_values' and 'voltage_values' are always required."
-            ) from exc
-
-        temperature_values = dataset.get("temperature_values")
-        if temperature_values is not None:
-            temperature_values = np.asarray(temperature_values, dtype=float)
-
-        soc_values = dataset.get("soc_values")
         # pylint: disable=protected-access
-        if self.statespace._soc_source is not SocSource.STATE and soc_values is None:
-            raise KeyError(
-                "dataset['soc_values'] is required when the statespace uses "
-                "SocSource.EXOGENOUS (i.e. 's' is not in state_components)."
-            )
-        if soc_values is not None:
-            soc_values = np.asarray(soc_values, dtype=float)
-
-        num_timesteps = min(len(current_values), len(voltage_values))
-        if temperature_values is not None:
-            num_timesteps = min(num_timesteps, len(temperature_values))
-        if soc_values is not None:
-            num_timesteps = min(num_timesteps, len(soc_values))
-
-        if num_timesteps < 2:
-            raise ValueError(
-                f"dataset has {num_timesteps} samples but the filter "
-                f"needs at least 2 (one initial condition + one filter step)."
-            )
+        current_values, voltage_values, temperature_values, soc_values, num_timesteps = (
+            parse_dataset(dataset, self.statespace._soc_source)
+        )
 
         self.state_estimate = np.asarray(initial_state, dtype=float).copy()
         self.error_covariance = np.asarray(initial_covariance, dtype=float).copy()
@@ -309,27 +280,10 @@ class ExtendedKalmanFilter:
 
     def _validate_variances(self) -> None:
         """Non-negativity for all provided variances; presence gated on state_components."""
-        def check_nonnegative(name: str, value: float) -> None:
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative, got {value}.")
-
         check_nonnegative("variance_eta_u",   self.variance_eta_u)
         check_nonnegative("variance_eta_y_e", self.variance_eta_y_e)
-
-        components = self.statespace.state_components
-        optional = [
-            ("variance_eta_theta",    self.variance_eta_theta,
-             any(c.startswith("theta_") for c in components), "any 'theta_*' entry"),
-            ("variance_eta_capacity", self.variance_eta_capacity,
-             "capacity" in components, "'capacity'"),
-        ]
-        for name, value, required, context in optional:
-            if required:
-                if value is None:
-                    raise ValueError(
-                        f"{name} is required when state_components contains {context}."
-                    )
-                check_nonnegative(name, value)
+        validate_optional_variances(self.statespace,
+                                    self.variance_eta_theta, self.variance_eta_capacity)
 
 
     def _build_extended_state_noise_diag(self) -> np.ndarray:
