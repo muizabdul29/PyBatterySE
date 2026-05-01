@@ -10,7 +10,6 @@
 
 **PyBatterySE** — a shorthand for **Py**thon **Battery** **S**tate **E**stimation, is an open-source library for state estimation using Bayesian filters and linear parameter-varying (LPV) battery models.
 
-> ⚠️ **Beta:** This package is in beta. Core functionality works, but APIs may change before the stable release. Feedback and bug reports are welcome!
 
 ## Installation
 
@@ -26,46 +25,48 @@ PyBatterySE is a companion package to PyBatteryID, and utilises the models ident
 
 ## Basic usage
 
-In the following, an example usage of PyBatterySE has been demonstrated for performing state estimation of batteries, including SOC estimation, and ageing-aware parameter (and capacity) estimation.
+In the following, example usages of PyBatterySE have been demonstrated for performing battery state estimation, including SOC estimation, SOC observability analysis, and ageing-aware parameter and capacity estimation.
 
 #### 1. SOC estimation
 
-For SOC estimation, we currently have two options, namely (i) extended Kalman filter (EKF), and (ii) particle filter (PF). In both cases, the state corresponding to overpotential model obtained using PyBatteryID is augmented with an extra SOC state, that is, $x = [s \ x_1 \ \cdots \ x_n]^\top$. Below, we give two basic example usages for SOC estimation using EKF and PF.
+For SOC estimation, two filter options are available: (i) extended Kalman filter (EKF), and (ii) particle filter (PF). In both cases, a `StateSpace` object is first constructed from the identified model, specifying which quantities form the state vector. The state is then augmented with the SOC: $x = [s \ x_1 \ \cdots \ x_n]^\top$.
 
 **Example 1: SOC estimation using EKF**
 
 ```python
+import numpy as np
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.filters.ekf import ExtendedKalmanFilter
+from pybatteryse.statespace import StateSpace
+from pybatteryse.filters import ExtendedKalmanFilter
 
 model = load_model_from_file('path/to/model.npy')
-dataset = helper.load_npy_datasets(f'path/to/dataset.npy')
-bad_current_measurements = [ ... ] # Bad current measurements
+dataset = {
+    'current_values': current_values,   # may contain bias/noise
+    'voltage_values': voltage_values,
+    'temperature_values': temperature_values,
+}
+
+# Build state-space representation
+ss = StateSpace(model, state_components=['s', 'overpotentials'])
 
 # Initialize EKF
 ekf = ExtendedKalmanFilter(
-    model=model,
-    sigma_nu=1e-3,        # Input noise variance
-    sigma_ny_ne=1e-3      # Measurement noise variance
+    statespace=ss,
+    variance_eta_u=1e-2,        # Input (current) noise variance
+    variance_eta_y_e=1e-3,      # Measurement (voltage) noise variance
 )
- 
-# Prepare initial conditions
-x0 = np.array([[0.5],    # Initial SOC
-               [0.0],    # state 1
-               [0.0],    # state 2
-               [0.0]])   # state 3
- 
-P0 = np.diag([1, 0.1, 0.1, 0.1])  # Initial covariance
- 
+
+# Initial conditions
+initial_state = np.array([0.5] + [0.0] * model.model_order)
+initial_covariance = np.diag([1.0] + [0.1] * model.model_order)
+
 # Run filter
-state_estimates = ekf.run(
-    temperature_values=dataset['temperature_values'],
-    current_values=bad_current_measurements,
-    voltage_values=dataset['voltage_values'],
-    initial_state=x0,
-    initial_covariance=P0
+state_estimates, error_covariances = ekf.run(
+    dataset=dataset,
+    initial_state=initial_state,
+    initial_covariance=initial_covariance,
 )
- 
+
 # Extract SOC estimates
 soc_estimates = state_estimates[:, 0]
 ```
@@ -73,36 +74,112 @@ soc_estimates = state_estimates[:, 0]
 **Example 2: SOC estimation using PF**
 
 ```python
+import numpy as np
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.filters.ekf import ParticleFilter
+from pybatteryse.statespace import StateSpace
+from pybatteryse.filters import ParticleFilter
 
 model = load_model_from_file('path/to/model.npy')
-dataset = helper.load_npy_datasets(f'path/to/dataset.npy')
-bad_current_measurements = [ ... ] # Bad current measurements
+dataset = {
+    'current_values': current_values,
+    'voltage_values': voltage_values,
+    'temperature_values': temperature_values,
+}
+
+# Build state-space representation
+ss = StateSpace(model, state_components=['s', 'overpotentials'])
 
 # Initialize PF
 pf = ParticleFilter(
-    model,
-    num_particles=5,
-    eta_bounds=(-4, -1),
-    sigma_ny_ne=1e-3
+    statespace=ss,
+    num_particles=20,
+    eta_bounds=(-4, -1),        # Uniform bounds for current-sensor bias
+    variance_eta_y_e=1e-3,      # Measurement noise variance
 )
- 
-initial_particles = np.hstack((
-    np.random.uniform(0.0001, 0.9999, size=(pf.num_particles, 1)),
-    np.zeros((pf.num_particles, model.model_order))
-))
 
-state_estimates = pf.run(initial_particles=initial_particles,
-                         temperature_values=temperature_values,
-                         current_values=bad_current_measurements,
-                         voltage_values=voltage_values)
+# Run filter ('auto' initialises particles uniformly over the SOC domain)
+state_estimates, _ = pf.run(
+    dataset=dataset,
+    initial_particles='auto',
+)
 
 soc_estimates = state_estimates[:, 0]
-
 ```
 
-#### 2. Ageing-aware model estimation
+#### 2. SOC observability analysis
 
-We can perform ageing-aware model estimation using recursive state estimation. The detailed methodology is explained in [X], which proposes alternative approaches as well. An example has been provided in the examples folder, which can be consulted for more details.
+SOC observability can be quantified using finite-horizon observability Gramians, which measure the accumulated sensitivity of the terminal voltage to a unit SOC perturbation over a fixed time horizon. An example is provided in `examples/3_soc_observability_analysis.ipynb`.
 
+```python
+from pybatteryid.utilities import load_model_from_file
+from pybatteryse.statespace import StateSpace
+from pybatteryse.utilities import compute_soc_observability_contributions, simulate_state_trajectory
+from pybatteryse.plotter import plot_soc_vs_gramian
+
+model = load_model_from_file('path/to/model.npy')
+ss = StateSpace(model, state_components=['s', 'overpotentials'])
+
+state_trajectory = simulate_state_trajectory(ss, dataset)
+gramian_contributions = compute_soc_observability_contributions(ss, state_trajectory, dataset)
+
+plot_soc_vs_gramian(
+    [(state_trajectory[:, 0], gramian_contributions['total'])],
+)
+```
+
+#### 3. Ageing-aware model estimation
+
+Joint estimation of battery capacity and ageing-related model parameters can be performed by extending the state vector with the parameters to be tracked. These *free parameters* follow random-walk dynamics and are estimated alongside the physical states using EKF. An example is provided in `examples/4_ageing_aware_model_estimation_with_ekf.ipynb`.
+
+```python
+import numpy as np
+from pybatteryid.utilities import load_model_from_file
+from pybatteryse.statespace import StateSpace
+from pybatteryse.filters import ExtendedKalmanFilter
+
+model = load_model_from_file('path/to/model.npy')
+dataset = {
+    'current_values': current_values,
+    'voltage_values': voltage_values,
+    'temperature_values': temperature_values,
+}
+
+# Augment state with free parameters and capacity
+ss = StateSpace(model, state_components=['s', 'overpotentials', 'theta_3', 'theta_6', 'capacity'])
+
+ekf = ExtendedKalmanFilter(
+    statespace=ss,
+    variance_eta_u=1e-3,
+    variance_eta_y_e=1e-3,
+    variance_eta_theta=1e-12,       # Process noise for theta random walks
+    variance_eta_capacity=0.1,      # Process noise for capacity random walk
+)
+
+# Initial state: [soc, overpotentials..., theta_3, theta_6, capacity]
+initial_state = np.array([0.5, 0.0, theta_3_mean, theta_6_mean, capacity_nominal])
+initial_covariance = np.zeros((len(initial_state), len(initial_state)))
+
+state_estimates, _ = ekf.run(
+    dataset=dataset,
+    initial_state=initial_state,
+    initial_covariance=initial_covariance,
+)
+
+soc_est      = state_estimates[:, 0]
+theta_3_est  = state_estimates[:, 2]
+theta_6_est  = state_estimates[:, 3]
+capacity_est = state_estimates[:, 4]
+```
+
+## Examples
+
+The `examples/` folder contains four Jupyter notebooks along with the datasets required to run them:
+
+| # | Notebook | Description |
+|---|----------|-------------|
+| 1 | `1_soc_estimation_with_ekf.ipynb` | SOC estimation for NMC and LFP batteries using LTI and LPV models with EKF |
+| 2 | `2_soc_estimation_with_pf.ipynb` | SOC estimation for NMC and LFP batteries using LTI and LPV models with PF |
+| 3 | `3_soc_observability_analysis.ipynb` | SOC observability analysis via finite-horizon observability Gramians |
+| 4 | `4_ageing_aware_model_estimation_with_ekf.ipynb` | Recursive joint estimation of capacity and ageing parameters with EKF |
+
+Datasets are stored under `examples/data/` in three sub-folders: `nmc_soc_estimation/`, `lfp_soc_estimation/`, and `nmc_ageing_estimation/`.

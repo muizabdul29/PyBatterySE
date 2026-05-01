@@ -1,201 +1,342 @@
-"""Implementation of Particle Filter"""
+"""Implementation of Particle Filter."""
 
 import numpy as np
 
 from tqdm import tqdm
 
-from pybatteryid.dataclasses import Model
-
-from ..statespace import get_matrices, StateSpace
+from ..statespace import StateSpace, SocSource
+from ._common import check_nonnegative, validate_optional_variances, parse_dataset
 
 
 # pylint: disable=R0902
 class ParticleFilter:
-    """
-    Particle Filter for battery state estimation with current sensor bias.
+    """Bootstrap Particle Filter for battery state estimation with current
+    sensor bias.
+
+    Operates on a :class:`pybatteryse.statespace.StateSpace` instance and
+    propagates a weighted particle cloud through the state-transition and
+    measurement functions ``f`` and ``h`` defined by that statespace. Each
+    step has three stages: (1) propagate every particle via
+    ``evaluate_next_state`` using a bias-corrected previous current, then
+    add Gaussian process noise to any random-walk entries; (2) sample a
+    fresh current-sensor bias per particle, bias-correct the present
+    current, and score particles with a Gaussian likelihood on the voltage
+    residual via ``evaluate_predicted_measurement``; (3) multinomially
+    resample particles (and their bias values) according to the normalised
+    weights. Before each statespace call the filter syncs model parameters
+    and capacity from the particle's random-walk entries via
+    ``StateSpace.update_model_from_state``, so each particle's
+    linearization reflects its own belief about those quantities.
+
+    The current-sensor bias ``eta`` is modelled as a latent variable
+    sampled fresh each step from ``U(eta_bound_min, eta_bound_max)``; its
+    resampled values are carried alongside particles so the posterior over
+    bias informs subsequent steps. Random-walk dynamics for extended
+    states (``theta_{i}``, capacity) contribute Gaussian process noise
+    parameterized by ``variance_eta_theta`` and ``variance_eta_capacity``;
+    the ``s`` and ``overpotentials`` blocks are deterministic in
+    propagation. Particles whose state contains NaN / inf after
+    propagation, or whose statespace call raises, are flagged invalid and
+    receive zero weight; resampling removes them implicitly.
 
     Attributes:
-        num_particles: Number of particles
-        particles: State particles (num_particles, state_dim)
-        weights: Normalised particle weights (num_particles,)
-        eta_particles: Current sensor bias estimates per particle (num_particles,)
-        statespace: StateSpace representation of the battery model
+        statespace: StateSpace representation of the battery model.
+        num_particles: Number of particles in the cloud.
+        eta_bound_min, eta_bound_max: Bounds of the uniform distribution
+            from which the current-sensor bias ``eta`` is sampled each
+            step.
+        variance_eta_y_e: Variance of the Gaussian voltage-measurement
+            noise used in the likelihood.
+        variance_eta_theta: Variance of the random-walk process noise on
+            ``theta_{i}`` states. Required when any ``theta_{i}`` is in
+            state_components, ``None`` otherwise.
+        variance_eta_capacity: Variance of the random-walk process noise
+            on the ``capacity`` state. Required when ``capacity`` is in
+            state_components, ``None`` otherwise.
+        particles: Current particle states, shape
+            ``(num_particles, state_dimension)``. ``None`` until
+            ``run`` is called. Holds the post-resample cloud after each
+            ``step``.
+        weights: Normalised particle weights from the most recent
+            measurement update (pre-resample), shape
+            ``(num_particles,)``. Initialised uniform; refreshed by
+            ``step``. These index the propagated particle cloud at the
+            update, not the post-resample ``particles`` field.
+        eta_particles: Current-sensor-bias estimates per particle, shape
+            ``(num_particles,)``, carried through resampling.
     """
 
-    # Class variables
+    statespace: StateSpace
+
+    variance_eta_y_e: float
+    variance_eta_theta: float | None
+    variance_eta_capacity: float | None
+
+    # Number of particles
     num_particles: int
 
+    # Input uncertainty bounds
     eta_bound_min: float
     eta_bound_max: float
-    eta_particles: np.ndarray
-
-    sigma_ny_ne: float
-
-    statespace: StateSpace
-    emf_function: callable
-    state_dim: int
-
-    matrix_a_stack: np.ndarray
-    matrix_b_stack: np.ndarray
-    matrix_c_stack: np.ndarray
-    matrix_d_stack: np.ndarray
 
     particles: np.ndarray
     weights: np.ndarray
+    eta_particles: np.ndarray
 
-    def __init__(self, model: Model, num_particles: int, eta_bounds: tuple[float, float],
-                 sigma_ny_ne: float):
+    # pylint: disable=R0913, R0917
+    def __init__(self,
+                 statespace: StateSpace,
+                 num_particles: int,
+                 eta_bounds: tuple[float, float],
+                 variance_eta_y_e: float,
+                 variance_eta_theta: float | None = None,
+                 variance_eta_capacity: float | None = None):
         """
         Initialise particle filter.
 
         Args:
-            model: Battery model (Model dataclass) to create StateSpace from
-            num_particles: Number of particles to use
-            eta_bounds: Tuple of (min, max) for current sensor bias
-            sigma_ny_ne: Measurement noise variance (scalar)
+            statespace: Pre-constructed StateSpace for the battery model.
+                Its state_components determines the state-vector layout
+                used by the filter.
+            num_particles: Number of particles to use.
+            eta_bounds: Tuple of (min, max) for current sensor bias.
+            variance_eta_y_e: Measurement noise variance (scalar).
+            variance_eta_theta: Process noise variance for random-walk
+                theta parameters. Must be provided (non-None) when any
+                'theta_{i}' appears in statespace.state_components; pass
+                None otherwise.
+            variance_eta_capacity: Process noise variance for the
+                random-walk capacity state. Must be provided (non-None)
+                when 'capacity' appears in statespace.state_components;
+                pass None otherwise.
         """
+        self.statespace = statespace
         self.num_particles = num_particles
         self.eta_bound_min, self.eta_bound_max = eta_bounds
-        self.sigma_ny_ne = sigma_ny_ne
+        self.variance_eta_y_e = variance_eta_y_e
+        self.variance_eta_theta = variance_eta_theta
+        self.variance_eta_capacity = variance_eta_capacity
 
-        # Create state space representation from model
-        self.statespace = StateSpace(model)
-        self.emf_function = model.emf_function
-        self.state_dim = model.model_order + 1
+        self._validate_variances()
+
+        # Per-state-entry process-noise std-devs; zero for deterministic blocks.
+        self._process_noise_std = self._build_process_noise_std_diag()
 
         # Preallocate particle attributes
         self.weights = np.ones(self.num_particles) / self.num_particles
         self.eta_particles = np.zeros(self.num_particles)
 
-        # Preallocate matrices
-        self.matrix_a_stack = np.zeros((self.num_particles, self.state_dim, self.state_dim))
-        self.matrix_b_stack = np.zeros((self.num_particles, self.state_dim))
-        self.matrix_c_stack = np.zeros((self.num_particles, self.state_dim))
-        self.matrix_d_stack = np.zeros(self.num_particles)
-
         # Will be initialised when run() is called
         self.particles = None
 
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+
+    def _validate_variances(self) -> None:
+        """Non-negativity for all provided variances; presence gated on state_components."""
+        check_nonnegative("variance_eta_y_e", self.variance_eta_y_e)
+        validate_optional_variances(
+            self.statespace, self.variance_eta_theta, self.variance_eta_capacity)
+
+
+    def _build_process_noise_std_diag(self) -> np.ndarray:
+        """Length-state_dimension vector of random-walk process-noise std-devs.
+
+        Deterministic blocks ('s', 'overpotentials') get zero noise;
+        random-walk blocks ('theta_{i}', 'capacity') get the user-supplied
+        std-dev (sqrt of variance).
+        """
+        std = np.zeros(self.statespace.state_dimension)
+        offset = 0
+        # pylint: disable=protected-access
+        block_sizes = self.statespace._block_sizes
+        for component in self.statespace.state_components:
+            size = block_sizes[component]
+            if component.startswith('theta_'):
+                std[offset:offset + size] = np.sqrt(self.variance_eta_theta)
+            elif component == 'capacity':
+                std[offset:offset + size] = np.sqrt(self.variance_eta_capacity)
+            # 's' and 'overpotentials' stay zero.
+            offset += size
+        return std
+
+
+    # ----- main PF step -----
+
+
     # pylint: disable=R0913, R0914, R0917
-    def step(self, previous_temperature: float, previous_input: float, current_temperature: float,
-             current_input: float, current_voltage: float):
+    def step(self, previous_temperature: float, previous_input: float, present_temperature: float,
+             present_input: float, present_voltage: float,
+             previous_soc: float | None = None,
+             present_soc: float | None = None):
         """
         Execute one prediction-update cycle.
 
+        After this call, ``self.weights`` holds the normalised
+        per-particle weights from the measurement update (pre-resample),
+        which index the propagated particle cloud at this step rather
+        than the resampled ``self.particles``. Useful for diagnostics
+        like effective sample size or weight degeneracy.
+
         Args:
-            previous_temperature: Temperature at time k-1
-            previous_input: Current at time k-1
-            current_temperature: Temperature at time k
-            current_input: Current at time k
-            current_voltage: Voltage measurement at time k
+            previous_temperature: Temperature at time k-1 (may be None for
+                temperature-independent models).
+            previous_input: Current at time k-1.
+            present_temperature: Temperature at time k (may be None).
+            present_input: Current at time k.
+            present_voltage: Voltage measurement at time k.
+            previous_soc: SOC at time k-1, used during propagation.
+                Required when the underlying StateSpace uses exogenous
+                SOC (i.e. 's' is not in state_components); ignored
+                otherwise.
+            present_soc: SOC at time k, used during the measurement
+                update. Required when the StateSpace uses exogenous SOC;
+                ignored otherwise.
         """
-        # Compute bias-corrected currents
+        # pylint: disable=protected-access
+        if self.statespace._soc_source is not SocSource.STATE \
+                and (previous_soc is None or present_soc is None):
+            raise ValueError(
+                "previous_soc and present_soc are required when the StateSpace "
+                "uses SocSource.EXOGENOUS ('s' not in state_components)."
+            )
+        # Bias-correct the previous-step current for each particle
         previous_input_true = previous_input - self.eta_particles
 
-        # Propagation step: compute A, B matrices
-        invalid_particles = self.compute_propagation_matrices(previous_input_true,
-                                                              previous_temperature)
+        # Propagate each particle through f(x, i, T, soc)
+        particles_next, invalid_particles = self._propagate_particles(
+            previous_input_true, previous_temperature, previous_soc
+        )
 
-        # Propagate particles (no process noise)
-        particles_next = (np.einsum('nij,nj->ni', self.matrix_a_stack, self.particles) +
-                          self.matrix_b_stack * previous_input_true[:, None])
+        # Add process noise to random-walk components
+        if np.any(self._process_noise_std > 0):
+            noise = np.random.randn(self.num_particles, self.statespace.state_dimension) \
+                * self._process_noise_std[None, :]
+            particles_next = particles_next + noise
 
-        soc_next = particles_next[:, 0]
+        # Flag any particle whose state contains NaN or inf after
+        # propagation + noise. Out-of-domain SOC, divergent dynamics,
+        # or similar pathologies typically surface this way.
+        invalid_particles |= ~np.all(np.isfinite(particles_next), axis=1)
 
-        # Sample new current sensor bias for time k
-        eta_k = np.random.uniform(self.eta_bound_min, self.eta_bound_max, size=self.num_particles)
-        current_input_true = current_input - eta_k
+        # Sample fresh current sensor bias for time k
+        eta_k = np.random.uniform(self.eta_bound_min, self.eta_bound_max,
+                                  size=self.num_particles)
+        present_input_true = present_input - eta_k
 
-        # Measurement update: compute C, D matrices
-        invalid_particles |= self.compute_measurement_matrices(soc_next,
-                                                               current_input_true,
-                                                               current_temperature,
-                                                               invalid_particles)
-
-        # Invalidate out-of-bounds SOC
-        invalid_particles |= (soc_next < 0) | (soc_next > 1)
+        # Compute predicted voltage per particle via h(x, i, T, soc).
+        # Particles whose statespace calls raise (e.g. out-of-domain SOC)
+        # are caught and flagged inside _compute_weights.
         valid_particles = ~invalid_particles
-
-        # Compute weights using vectorised likelihood
-        weights_unnormalised = self.compute_weights(current_voltage, soc_next, particles_next,
-                                                    current_input_true, valid_particles)
+        weights_unnormalised = self._compute_weights(
+            present_voltage, particles_next, present_input_true,
+            present_temperature, present_soc, valid_particles
+        )
 
         # Normalise and resample
-        weights_normalised = self.normalise_weights(weights_unnormalised)
-        resampled_indices = np.random.choice(self.num_particles, size=self.num_particles,
-                                             p=weights_normalised, replace=True)
+        weights_normalised = self._normalise_weights(weights_unnormalised)
+        resampled_indices = np.random.choice(
+            self.num_particles, size=self.num_particles,
+            p=weights_normalised, replace=True
+        )
 
-        # Update particle set
+        # Update particle set. self.weights holds the pre-resample
+        # normalised weights for diagnostics; self.particles is the
+        # post-resample cloud.
         self.particles = particles_next[resampled_indices]
-        self.weights[:] = 1.0 / self.num_particles
+        self.weights = weights_normalised
         self.eta_particles = eta_k[resampled_indices]
 
 
-    def compute_propagation_matrices(self, previous_input_true, previous_temperature):
-        """Compute A and B matrices for all particles. Returns invalid mask."""
-        #
+    # ----- propagation -----
+
+
+    def _propagate_particles(self, previous_input_true: np.ndarray,
+                             previous_temperature: float | None,
+                             previous_soc: float | None):
+        """Run f(x, i, T, soc) for every particle; return (next_states, invalid_mask).
+
+        previous_soc is forwarded to StateSpace.evaluate_next_state only
+        when the StateSpace uses exogenous SOC; otherwise it is ignored
+        by the StateSpace. Passing None in STATE-SOC mode is fine.
+        """
+        particles_next = np.empty_like(self.particles)
         invalid_particles = np.zeros(self.num_particles, dtype=bool)
 
         for particle_idx in range(self.num_particles):
+            particle_state = self.particles[particle_idx]
             try:
-                matrix_a, matrix_b, _, _ = (mat.squeeze() for mat in
-                             get_matrices(self.statespace,
-                                          self.particles[particle_idx, 0],
-                                          previous_input_true[particle_idx],
-                                          previous_temperature))
-                self.matrix_a_stack[particle_idx] = matrix_a
-                self.matrix_b_stack[particle_idx] = matrix_b
-            except ValueError:
+                # Sync the shared statespace's model parameters to this
+                # particle's random-walk entries (theta_*, capacity).
+                # No-op when neither is in state_components.
+                self.statespace.update_model_from_state(particle_state)
+
+                particles_next[particle_idx] = self.statespace.evaluate_next_state(
+                    particle_state,
+                    current_value=previous_input_true[particle_idx],
+                    temperature_value=previous_temperature,
+                    soc_value=previous_soc,
+                )
+            except (ValueError, KeyError, IndexError):
                 invalid_particles[particle_idx] = True
+                particles_next[particle_idx] = particle_state  # placeholder
 
-        return invalid_particles
+        return particles_next, invalid_particles
 
 
-    def compute_measurement_matrices(self, soc_next, current_input_true, current_temperature,
-                                     invalid_particles):
-        """Compute C and D matrices for all valid particles. Returns updated invalid mask."""
-        #
-        for particle_idx in range(self.num_particles):
-            if invalid_particles[particle_idx]:
-                continue
-            try:
-                _, _, matrix_c, matrix_d = (mat.squeeze() for mat in
-                             get_matrices(self.statespace, soc_next[particle_idx],
-                                        current_input_true[particle_idx], current_temperature))
-                self.matrix_c_stack[particle_idx] = matrix_c
-                self.matrix_d_stack[particle_idx] = matrix_d
-            except ValueError:
-                invalid_particles[particle_idx] = True
+    # ----- measurement likelihood -----
 
-        return invalid_particles
 
     # pylint: disable=R0913, R0917
-    def compute_weights(self, current_voltage, soc_next, particles_next, current_input_true,
-                        valid_particles):
-        """Compute unnormalised weights using Gaussian likelihood."""
-        #
+    def _compute_weights(self, present_voltage: float, particles_next: np.ndarray,
+                         present_input_true: np.ndarray,
+                         present_temperature: float | None,
+                         present_soc: float | None,
+                         valid_particles: np.ndarray) -> np.ndarray:
+        """Compute unnormalised Gaussian likelihood weights per particle.
+
+        present_soc is forwarded to StateSpace.evaluate_predicted_measurement
+        only when the StateSpace uses exogenous SOC; otherwise it is ignored
+        by the StateSpace.
+        """
         weights_unnormalised = np.zeros(self.num_particles)
 
-        if np.any(valid_particles):
-            # Vectorised measurement prediction
-            emf_vals = self.emf_function(soc_next[valid_particles])
-            voltage_pred = (emf_vals + np.einsum('ni,ni->n', self.matrix_c_stack[valid_particles],
-                                                 particles_next[valid_particles]) +
-                                                 self.matrix_d_stack[valid_particles] *
-                                                 current_input_true[valid_particles])
+        if not np.any(valid_particles):
+            return weights_unnormalised
 
-            # Vectorised Gaussian likelihood
-            measurement_residuals = current_voltage - voltage_pred
-            weights_unnormalised[valid_particles] = (
-                np.exp(-0.5 * measurement_residuals**2 / self.sigma_ny_ne) /
-                np.sqrt(2 * np.pi * self.sigma_ny_ne)
-            )
+        # Local copy so failures during measurement eval don't leak back
+        # into the caller's invalid_particles mask.
+        valid_local = valid_particles.copy()
 
+        voltage_pred = np.zeros(self.num_particles)
+        for particle_idx in np.flatnonzero(valid_local):
+            particle_state = particles_next[particle_idx]
+            try:
+                self.statespace.update_model_from_state(particle_state)
+                voltage_pred[particle_idx] = self.statespace.evaluate_predicted_measurement(
+                    particle_state,
+                    current_value=present_input_true[particle_idx],
+                    temperature_value=present_temperature,
+                    soc_value=present_soc,
+                )
+            except (ValueError, KeyError, IndexError):
+                valid_local[particle_idx] = False
+
+        if not np.any(valid_local):
+            return weights_unnormalised
+
+        residuals = present_voltage - voltage_pred[valid_local]
+        weights_unnormalised[valid_local] = (
+            np.exp(-0.5 * residuals**2 / self.variance_eta_y_e)
+            / np.sqrt(2 * np.pi * self.variance_eta_y_e)
+        )
         return weights_unnormalised
 
 
-    def normalise_weights(self, weights_unnormalised):
+    def _normalise_weights(self, weights_unnormalised: np.ndarray) -> np.ndarray:
         """Normalise weights with degeneracy check."""
         weight_sum = np.sum(weights_unnormalised)
         if weight_sum == 0:
@@ -203,59 +344,149 @@ class ParticleFilter:
         return weights_unnormalised / weight_sum
 
 
-    def estimate(self):
-        """Return weighted mean state estimate."""
-        return np.average(self.particles, axis=0, weights=self.weights)
+    # ----- estimation and driver -----
 
 
-    def run(self, initial_particles: np.ndarray, temperature_values: np.ndarray,
-            current_values: np.ndarray, voltage_values: np.ndarray):
+    def estimate(self) -> np.ndarray:
+        """Return the mean state estimate over the post-resample cloud.
+
+        Importance weighting is already baked into ``self.particles`` by
+        the resampling step, so a plain mean is the correct estimator
+        here. ``self.weights`` carries the pre-resample weights for
+        diagnostics and indexes a different cloud, so it is intentionally
+        not used.
         """
-        Run particle filter over entire measurement sequence.
+        return self.particles.mean(axis=0)
+
+
+    def _generate_initial_particles(self) -> np.ndarray:
+        """Sample initial particles uniformly per state_components block.
+
+        Bounds per block:
+            - 's'           : U(0, 1)
+            - 'overpotentials' : 0
+            - 'theta_{i}'   : U(theta_i - sqrt(var_theta), theta_i + sqrt(var_theta))
+            - 'capacity'    : U(capacity - sqrt(var_capacity), capacity + sqrt(var_capacity))
+        """
+        particles = np.zeros((self.num_particles, self.statespace.state_dimension))
+
+        offset = 0
+        for component in self.statespace.state_components:
+            # pylint: disable-next=protected-access
+            size = self.statespace._block_sizes[component]
+            if component == 's':
+                particles[:, offset] = np.random.uniform(0.0, 1.0,
+                                                         size=self.num_particles)
+            elif component.startswith('theta_'):
+                theta_index = int(component[len('theta_'):]) - 1
+                centre = float(self.statespace.model_estimate[theta_index])
+                half_width = np.sqrt(self.variance_eta_theta)
+                particles[:, offset] = np.random.uniform(
+                    centre - half_width, centre + half_width,
+                    size=self.num_particles
+                )
+            elif component == 'capacity':
+                centre = float(self.statespace.battery_capacity)
+                half_width = np.sqrt(self.variance_eta_capacity)
+                particles[:, offset] = np.random.uniform(
+                    centre - half_width, centre + half_width,
+                    size=self.num_particles
+                )
+            # 'overpotentials' stays zero.
+            offset += size
+
+        return particles
+
+
+    # pylint: disable-next=too-many-branches
+    def run(self, dataset: dict, initial_particles: np.ndarray | str = 'auto'):
+        """
+        Run particle filter over the entire measurement sequence.
 
         Args:
-            initial_particles: Initial particle states array (num_particles, state_dim)
-            temperature_values: Temperature sequence (num_timesteps,)
-            current_values: Current measurements (num_timesteps,)
-            voltage_values: Voltage measurements (num_timesteps,)
+            dataset: Dict with measurement sequences. Expected keys:
+                    - 'voltage_values': (num_timesteps,)
+                    - 'current_values': (num_timesteps,)
+                    - 'temperature_values': (num_timesteps,) or None for
+                      temperature-independent models
+                    - 'soc_values': (num_timesteps,), required only when
+                      the StateSpace uses exogenous SOC
+            initial_particles: Either a (num_particles, state_dim) array
+                of initial states, or the string 'auto' to sample them
+                uniformly per state_components block. See
+                _generate_initial_particles for bounds.
 
         Returns:
-            estimates: State estimates at each time step (num_timesteps, state_dim)
+            Tuple ``(estimates, weight_trajectories)``:
+                - estimates: State estimates at each time step,
+                  shape ``(num_timesteps, state_dim)``.
+                - weight_trajectories: Normalised particle weights from
+                  each measurement update *before* resampling, shape
+                  ``(num_timesteps, num_particles)``. Row 0 is uniform
+                  (1/num_particles) since no update has occurred yet;
+                  rows 1..num_timesteps-1 contain the post-likelihood,
+                  pre-resample weights and pair with the propagated
+                  particle cloud at that step.
         """
-        # Validate initial_particles shape
+        # pylint: disable=protected-access
+        current_values, voltage_values, temperature_values, soc_values, num_timesteps = (
+            parse_dataset(dataset, self.statespace._soc_source))
+
+        # Resolve initial particles
+        if isinstance(initial_particles, str):
+            if initial_particles != 'auto':
+                raise ValueError(
+                    f"initial_particles string must be 'auto', got {initial_particles!r}."
+                )
+            initial_particles = self._generate_initial_particles()
+
+        # Shape validation
         if initial_particles.shape[0] != self.num_particles:
             raise ValueError(
                 f"initial_particles has {initial_particles.shape[0]} particles, "
                 f"but filter was initialised with num_particles={self.num_particles}"
             )
-        if initial_particles.shape[1] != self.state_dim:
+        if initial_particles.shape[1] != self.statespace.state_dimension:
             raise ValueError(
                 f"initial_particles has state dimension {initial_particles.shape[1]}, "
-                f"but filter expects state_dim={self.state_dim} (model_order + 1)"
+                f"but StateSpace expects state_dimension={self.statespace.state_dimension} "
+                f"(state_components={self.statespace.state_components})."
             )
 
-        # Initialise particles
-        self.particles = initial_particles
+        # Initialise particles (copy to avoid aliasing caller's array)
+        self.particles = np.array(initial_particles, dtype=float, copy=True)
 
-        # Reset weights and eta_particles to initial state
-        self.weights[:] = 1.0 / self.num_particles
+        # Reset per-run particle auxiliaries
+        self.weights = np.ones(self.num_particles) / self.num_particles
         self.eta_particles[:] = 0.0
 
-        # Get time horizon
-        num_timesteps = min(len(voltage_values), len(current_values), len(temperature_values))
+        state_estimates = np.zeros((num_timesteps, self.statespace.state_dimension))
+        weight_trajectories = np.zeros((num_timesteps, self.num_particles))
 
-        state_estimates = np.zeros((num_timesteps, self.state_dim))
         state_estimates[0] = self.estimate()
+        # No measurement update has occurred at k=0 — record the uniform
+        # prior weights to keep the array shape-aligned with state_estimates.
+        weight_trajectories[0] = self.weights
+
+        def scalar(arr, k):
+            return None if arr is None else float(arr[k])
 
         for k in tqdm(range(1, num_timesteps), desc="PF Progress", unit="step", ncols=100):
             try:
-                self.step(temperature_values[k-1], current_values[k-1],
-                         temperature_values[k], current_values[k],
-                         voltage_values[k])
-            except ValueError as e:
+                self.step(
+                    previous_temperature=scalar(temperature_values, k - 1),
+                    previous_input=scalar(current_values, k - 1),
+                    present_temperature=scalar(temperature_values, k),
+                    present_input=scalar(current_values, k),
+                    present_voltage=scalar(voltage_values, k),
+                    previous_soc=scalar(soc_values, k - 1),
+                    present_soc=scalar(soc_values, k),
+                )
+            except ValueError as exc:
                 raise RuntimeError(
-                    f"Particle filter failed at time step {k}: {str(e)}"
-                ) from e
+                    f"Particle filter failed at time step {k}: {exc}"
+                ) from exc
             state_estimates[k] = self.estimate()
+            weight_trajectories[k] = self.weights
 
-        return state_estimates
+        return state_estimates, weight_trajectories
