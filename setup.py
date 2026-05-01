@@ -8,7 +8,7 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name='pybatteryse',
-    version='2.0.0',
+    version='2.0.1',
     author='Muiz Sheikh',
     description='Battery State Estimation in Python',
     long_description=readme,
@@ -25,6 +25,5 @@ setup(
     classifiers = [
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
-        "Development Status :: 4 - Beta",
     ],
 )

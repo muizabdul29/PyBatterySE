@@ -3,6 +3,7 @@
 <div>
 
 [![release](https://img.shields.io/github/v/release/muizabdul29/PyBatterySE)](https://github.com/muizabdul29/PyBatterySE/releases)
+[![Tests](https://github.com/muizabdul29/PyBatterySE/actions/workflows/tests.yml/badge.svg)](https://github.com/muizabdul29/PyBatterySE/actions/workflows/tests.yml)
 [![Pylint](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml/badge.svg)](https://github.com/muizabdul29/PyBatterySE/actions/workflows/pylint.yml)
 
 </div>
@@ -36,8 +37,7 @@ For SOC estimation, two filter options are available: (i) extended Kalman filter
 ```python
 import numpy as np
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.statespace import StateSpace
-from pybatteryse.filters import ExtendedKalmanFilter
+from pybatteryse import load_statespace_representation, load_filter
 
 model = load_model_from_file('path/to/model.npy')
 dataset = {
@@ -47,11 +47,12 @@ dataset = {
 }
 
 # Build state-space representation
-ss = StateSpace(model, state_components=['s', 'overpotentials'])
+ss = load_statespace_representation(model, state_components=['s', 'overpotentials'])
 
 # Initialize EKF
-ekf = ExtendedKalmanFilter(
-    statespace=ss,
+ekf = load_filter(
+    ss,
+    'extended_kalman_filter',
     variance_eta_u=1e-2,        # Input (current) noise variance
     variance_eta_y_e=1e-3,      # Measurement (voltage) noise variance
 )
@@ -76,8 +77,7 @@ soc_estimates = state_estimates[:, 0]
 ```python
 import numpy as np
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.statespace import StateSpace
-from pybatteryse.filters import ParticleFilter
+from pybatteryse import load_statespace_representation, load_filter
 
 model = load_model_from_file('path/to/model.npy')
 dataset = {
@@ -87,11 +87,12 @@ dataset = {
 }
 
 # Build state-space representation
-ss = StateSpace(model, state_components=['s', 'overpotentials'])
+ss = load_statespace_representation(model, state_components=['s', 'overpotentials'])
 
 # Initialize PF
-pf = ParticleFilter(
-    statespace=ss,
+pf = load_filter(
+    ss,
+    'particle_filter',
     num_particles=20,
     eta_bounds=(-4, -1),        # Uniform bounds for current-sensor bias
     variance_eta_y_e=1e-3,      # Measurement noise variance
@@ -112,12 +113,12 @@ SOC observability can be quantified using finite-horizon observability Gramians,
 
 ```python
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.statespace import StateSpace
+from pybatteryse import load_statespace_representation
 from pybatteryse.utilities import compute_soc_observability_contributions, simulate_state_trajectory
 from pybatteryse.plotter import plot_soc_vs_gramian
 
 model = load_model_from_file('path/to/model.npy')
-ss = StateSpace(model, state_components=['s', 'overpotentials'])
+ss = load_statespace_representation(model, state_components=['s', 'overpotentials'])
 
 state_trajectory = simulate_state_trajectory(ss, dataset)
 gramian_contributions = compute_soc_observability_contributions(ss, state_trajectory, dataset)
@@ -134,8 +135,7 @@ Joint estimation of battery capacity and ageing-related model parameters can be 
 ```python
 import numpy as np
 from pybatteryid.utilities import load_model_from_file
-from pybatteryse.statespace import StateSpace
-from pybatteryse.filters import ExtendedKalmanFilter
+from pybatteryse import load_statespace_representation, load_filter
 
 model = load_model_from_file('path/to/model.npy')
 dataset = {
@@ -145,10 +145,11 @@ dataset = {
 }
 
 # Augment state with free parameters and capacity
-ss = StateSpace(model, state_components=['s', 'overpotentials', 'theta_3', 'theta_6', 'capacity'])
+ss = load_statespace_representation(model, state_components=['s', 'overpotentials', 'theta_3', 'theta_6', 'capacity'])
 
-ekf = ExtendedKalmanFilter(
-    statespace=ss,
+ekf = load_filter(
+    ss,
+    'extended_kalman_filter',
     variance_eta_u=1e-3,
     variance_eta_y_e=1e-3,
     variance_eta_theta=1e-12,       # Process noise for theta random walks
