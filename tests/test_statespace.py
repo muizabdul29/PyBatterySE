@@ -27,12 +27,11 @@ def test_state_transition_soc_w_overpotentials(model: Model):
     # Negative current = discharge, so with current_value=-1 SOC increases
     expected_soc = state[0] + (current_value * model.sampling_period) / model.battery_capacity
     #
-    io_traj, p_traj, h_traj = ss._build_signal_trajectories(
+    trajectories = ss._build_signal_trajectories(
         soc_values=state[0],
         current_values=current_value,
         temperature_values=temperature_value,
     )
-    trajectories = io_traj | p_traj | h_traj
     #
     a_1 = evaluate_coefficient(ss.coefficients['a_1'], trajectories, 0)
     a_2 = evaluate_coefficient(ss.coefficients['a_2'], trajectories, 0)
@@ -66,12 +65,11 @@ def test_predicted_measurement_using_ss(model: Model):
                                                          current_value=current_value,
                                                          temperature_value=temperature_value)
 
-    io_traj, p_traj, h_traj = ss._build_signal_trajectories(
+    trajectories = ss._build_signal_trajectories(
         soc_values=state[0],
         current_values=current_value,
         temperature_values=temperature_value,
     )
-    trajectories = io_traj | p_traj | h_traj
     #
     b_0 = evaluate_coefficient(ss.coefficients['b_0'], trajectories, 0)
     #

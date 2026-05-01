@@ -12,5 +12,5 @@ def model():
     #
     parent_directory = os.path.dirname(os.path.dirname(__file__))
     m = load_model_from_file(f'{parent_directory}/examples/data/'
-                             'nmc_with_temperature/model_n,l=3,3.npy')
+                             'nmc_soc_estimation/model_lpv_n,l=3,3.npy')
     return m
